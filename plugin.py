@@ -720,8 +720,8 @@ class MaiLoverPlugin(MaiBotPlugin):
             configured = self.config.plugin.lover_name
             if configured and configured.strip():
                 return configured.strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.ctx.logger.debug("MaiLover: 读取 lover_name 配置失败（属性不存在或值非法）: %s", exc)
         if self._cached_nickname:
             return self._cached_nickname
         return "麦麦"
