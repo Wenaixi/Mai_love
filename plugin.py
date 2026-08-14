@@ -69,6 +69,27 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
+    def _truncate_kwargs_for_injection(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """截断 kwargs 中的大 list 字段（chat_history/messages/history），保留最新 N 条。
+
+        目标：把超 500KB 的 kwargs 降到合理大小后仍能注入当前活动信息。
+        不动 extra_prompt / 当前消息 / stream_id 等关键字段。
+        """
+        import copy as _copy
+        result = _copy.copy(kwargs)
+        MAX_ITEMS = 30  # 每个大 list 最多保留 30 条
+        # 已知会变大的 list 字段名(MaiBot planner kwargs 实际结构)
+        big_list_keys = (
+            "chat_history", "messages", "message_history", "history",
+            "context_messages", "recent_messages", "all_messages",
+            "knowledge_chunks", "memory_items",
+        )
+        for key in big_list_keys:
+            if key in result and isinstance(result[key], list) and len(result[key]) > MAX_ITEMS:
+                # 保留最后 N 条(最新消息更有用)
+                result[key] = result[key][-MAX_ITEMS:]
+        return result
+
     async def on_load(self) -> None:
         """初始化插件：创建所有子模块，缓存人设，启动调度器。"""
         data_dir = self._get_data_dir()
@@ -224,17 +245,29 @@ class MaiLoverPlugin(MaiBotPlugin):
         if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
 
-        # 防护：kwargs 过大时跳过注入（避免触发主程序帧大小限制）
+        # 防护：kwargs 过大时截断大字段而非直接跳过
+        # 原实现：超过 1MB 直接 return，导致 47 次/6h 警告且麦麦失去当前活动上下文
+        # 新实现：把可能的冗余大字段（chat_history/messages/history）截断后注入
+        #         极端大（>500KB）才降级 log level 仍跳过
         try:
             import json as _json
             kwargs_size = len(_json.dumps(kwargs, default=str, ensure_ascii=False))
-            if kwargs_size > 1_000_000:  # 1MB
-                self.ctx.logger.warning(
-                    f"planner kwargs 过大 ({kwargs_size} bytes)，跳过活动注入"
-                )
-                return {"action": "continue", "modified_kwargs": kwargs}
-        except Exception:
-            pass
+            if kwargs_size > 500_000:  # 500KB 硬阈值：超过才放弃
+                # 尝试截断大字段后再注入
+                truncated = self._truncate_kwargs_for_injection(kwargs)
+                truncated_size = len(_json.dumps(truncated, default=str, ensure_ascii=False))
+                if truncated_size < kwargs_size:
+                    self.ctx.logger.debug(
+                        f"planner kwargs 过大 ({kwargs_size}→{truncated_size} bytes)，已截断大字段后注入"
+                    )
+                    kwargs = truncated
+                else:
+                    self.ctx.logger.debug(
+                        f"planner kwargs 过大 ({kwargs_size} bytes)，无可截断字段，跳过注入"
+                    )
+                    return {"action": "continue", "modified_kwargs": kwargs}
+        except Exception as exc:
+            self.ctx.logger.debug("planner kwargs size check 异常: %s", type(exc).__name__)
 
         now = datetime.now()
         current_date = now.strftime("%Y-%m-%d")
