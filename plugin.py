@@ -12,11 +12,19 @@ v2.0.0 架构变更：
   on_config_update(scope="bot") 时刷新
 - 删除关键词拦截（hook_handler.py），消息正常放行给 planner
 
+v2.2.1 兼容性修复（适配 MaiBot 1.2.5+ / SDK 2.8.x）：
+- get_components()：全部组件声明顶层注入 chat_scope="private"，
+  防止私聊专用工具泄漏进群聊工具列表（issue #14）
+- maisaka.planner.before_request：载荷由 extra_prompt 改为 Context Items
+  （items + item_schema_version），改为向 items 注入 SystemMessageItem，
+  并按 kwargs 实际键做新旧双兼容（旧版回退 extra_prompt）
+
 导出 create_plugin() 函数返回 MaiLoverPlugin 实例。
 """
 
 import asyncio
 import os
+import uuid
 from datetime import datetime
 from typing import Any, ClassVar, Iterable, Optional
 
@@ -41,7 +49,9 @@ class MaiLoverPlugin(MaiBotPlugin):
     - on_load: 初始化所有子模块，缓存人设，启动调度器
     - on_unload: 停止调度器，刷新好感度数据
     - on_config_update: 热重载配置，scope="bot" 时刷新人设
-    - on_planner_before_request: 注入麦麦当前活动到 planner extra_prompt
+    - get_components: 全部组件注入 chat_scope="private"（私聊专用）
+    - on_planner_before_request: 把麦麦当前状态（日期/活动/好感度）
+      注入 planner 请求上下文（Context Items，旧版回退 extra_prompt）
     - Tools: mai_lover_status / mai_lover_schedule / mai_lover_send_message /
              mai_lover_affection / mai_lover_config / mai_lover_current_activity
     - Commands: /mai_status / /mai_schedule / /mai_affection / /mai_help /
@@ -66,6 +76,27 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._cached_personality: str = ""
         self._stream_retry_task: Optional[asyncio.Task[Any]] = None
         self._cached_nickname: str = ""
+
+    # ── 组件作用域 ─────────────────────────────────────────────────────
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """收集组件声明，并将全部组件限制为私聊专用。
+
+        麦麦恋人是私聊专用插件。Host 在收集 LLM 可用工具时会按组件声明
+        **顶层**的 ``chat_scope`` 字段过滤（all / group / private，缺省 all）：
+        只有 ``is_group_chat`` 与 scope 匹配时组件才被暴露。
+        此前未声明该字段，导致 MaiLover 的 Tool 出现在群聊工具列表中（issue #14）。
+
+        这里统一把全部组件标记为 ``chat_scope="private"``，
+        使 Host 在群聊场景下不再向 LLM 暴露本插件的 Tool / Command / API 等组件。
+
+        Returns:
+            list[dict[str, Any]]: 注入 chat_scope 后的组件声明列表。
+        """
+        components = super().get_components()
+        for component in components:
+            component["chat_scope"] = "private"
+        return components
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -217,12 +248,19 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     @HookHandler("maisaka.planner.before_request")
     async def on_planner_before_request(self, **kwargs: Any) -> dict[str, Any]:
-        """注入麦麦当前活动状态到 planner 的 extra_prompt。
+        """把麦麦当前状态（日期 / 活动 / 好感度）注入 planner 请求上下文。
 
-        每次 planner 请求时触发（含用户正常回复和 proactive trigger），
-        让麦麦在任何时候都知道自己在做什么。
+        每次 planner 请求时触发（含用户正常回复与 proactive trigger），
+        让麦麦在任何时刻都知道自己"现在在做什么"。
 
-        追加方式（非覆盖）：在已有 extra_prompt 后拼接状态后缀。
+        契约随主程序版本变化，需双兼容：
+        - MaiBot 1.2.5+ / SDK 2.8.x：planner hook 载荷为 Context Items
+          （``items`` + ``item_schema_version``），旧字段 ``extra_prompt`` 已移除；
+          注入方式为向 items 追加 System 消息项。
+        - 旧版：``extra_prompt`` 为字符串，追加（非覆盖）。
+
+        按 kwargs 中**实际存在的键**判断走哪条路；两者都缺失时跳过注入，
+        不消费任何状态，等待下次请求。
         """
         if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
@@ -254,9 +292,56 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
         )
 
-        # 追加非覆盖
-        kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
+        # 新版（MaiBot 1.2.5+ / SDK 2.8.x）：注入 Context Items
+        items = kwargs.get("items")
+        if isinstance(items, list):
+            self._inject_state_item(items, suffix)
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        # 旧版：extra_prompt 字符串追加（非覆盖）
+        if "extra_prompt" in kwargs:
+            kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        # 契约不匹配（既无 items 也无 extra_prompt）：不注入、不消费状态
+        self.ctx.logger.warning(
+            "planner hook kwargs 既无 items 也无 extra_prompt，跳过状态注入"
+        )
         return {"action": "continue", "modified_kwargs": kwargs}
+
+    @staticmethod
+    def _inject_state_item(items: list[Any], text: str) -> None:
+        """把状态文本注入 planner 的 Context Items（原地修改）。
+
+        优先追加到最后一条 SystemMessageItem 的 ``parts``；若载荷中没有
+        System 消息项，则新建一个 SystemMessageItem 追加到列表末尾。
+
+        Item 结构须满足主程序 ``deserialize_context_item_snapshot`` 的校验：
+        ``item_type`` 为非空字符串、``meta`` 必含 ``item_id`` / ``logical_turn_id`` /
+        ``timestamp``（合法 ISO 时间）、``parts`` 每项为 ``{"type": "text", "text": ...}``。
+
+        Args:
+            items: planner hook 载荷中的 Context Item 字典列表。
+            text: 待注入的状态文本。
+        """
+        for item in reversed(items):
+            if isinstance(item, dict) and item.get("item_type") == "SystemMessageItem":
+                parts = item.get("parts")
+                if isinstance(parts, list):
+                    parts.append({"type": "text", "text": text})
+                    return
+
+        items.append(
+            {
+                "item_type": "SystemMessageItem",
+                "meta": {
+                    "item_id": uuid.uuid4().hex,
+                    "logical_turn_id": None,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                "parts": [{"type": "text", "text": text}],
+            }
+        )
 
     @HookHandler("maisaka.replyer.after_response", mode=HookMode.OBSERVE)
     async def on_replyer_after_response(self, **kwargs: Any) -> None:
