@@ -12,11 +12,18 @@ v2.0.0 架构变更：
   on_config_update(scope="bot") 时刷新
 - 删除关键词拦截（hook_handler.py），消息正常放行给 planner
 
+v2.2.1 兼容性修复（适配 MaiBot 1.2.5+ / SDK 2.8.x）：
+- get_components()：全部组件声明顶层注入 chat_scope="private"，
+  防止私聊专用工具泄漏进群聊工具列表（issue #14）
+- maisaka.planner.before_request：载荷由 extra_prompt 改为 Context Items
+  （items + item_schema_version），改为向 items 注入 SystemMessageItem，
+  并按 kwargs 实际键做新旧双兼容（旧版回退 extra_prompt）
 导出 create_plugin() 函数返回 MaiLoverPlugin 实例。
 """
 
 import asyncio
 import os
+import uuid
 from datetime import datetime
 from typing import Any, ClassVar, Iterable, Optional
 
@@ -41,7 +48,9 @@ class MaiLoverPlugin(MaiBotPlugin):
     - on_load: 初始化所有子模块，缓存人设，启动调度器
     - on_unload: 停止调度器，刷新好感度数据
     - on_config_update: 热重载配置，scope="bot" 时刷新人设
-    - on_planner_before_request: 注入麦麦当前活动到 planner extra_prompt
+    - get_components: 全部组件注入 chat_scope="private"（私聊专用）
+    - on_planner_before_request: 把麦麦当前状态（日期/活动/好感度）
+      注入 planner 请求上下文（Context Items，旧版回退 extra_prompt）
     - Tools: mai_lover_status / mai_lover_schedule / mai_lover_send_message /
              mai_lover_affection / mai_lover_config / mai_lover_current_activity
     - Commands: /mai_status / /mai_schedule / /mai_affection / /mai_help /
@@ -66,6 +75,28 @@ class MaiLoverPlugin(MaiBotPlugin):
         self._cached_personality: str = ""
         self._stream_retry_task: Optional[asyncio.Task[Any]] = None
         self._cached_nickname: str = ""
+
+# 组件作用域与 Lifecycle 合并：上游新增 chat_scope 过滤，本地新增 kwargs 截断
+    # ── 组件作用域 ─────────────────────────────────────────────────────
+
+    def get_components(self) -> list[dict[str, Any]]:
+        """收集组件声明，并将全部组件限制为私聊专用。
+
+        麦麦恋人是私聊专用插件。Host 在收集 LLM 可用工具时会按组件声明
+        **顶层**的 ``chat_scope`` 字段过滤（all / group / private，缺省 all）：
+        只有 ``is_group_chat`` 与 scope 匹配时组件才被暴露。
+        此前未声明该字段，导致 MaiLover 的 Tool 出现在群聊工具列表中（issue #14）。
+
+        这里统一把全部组件标记为 ``chat_scope="private"``，
+        使 Host 在群聊场景下不再向 LLM 暴露本插件的 Tool / Command / API 等组件。
+
+        Returns:
+            list[dict[str, Any]]: 注入 chat_scope 后的组件声明列表。
+        """
+        components = super().get_components()
+        for component in components:
+            component["chat_scope"] = "private"
+        return components
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -96,6 +127,8 @@ class MaiLoverPlugin(MaiBotPlugin):
         self.ctx.logger.info(f"MaiLover 数据目录: {data_dir}")
         os.makedirs(data_dir, exist_ok=True)
 
+        # 数据迁移：旧式 <plugin>/data/ → ctx.paths.data_dir（SDK 2.6.0+）
+        self._migrate_old_data_dir(data_dir)
         if not self.config.plugin.enabled:
             self.ctx.logger.info("MaiLover 插件已禁用（plugin.enabled=false），跳过初始化")
             return
@@ -235,12 +268,19 @@ class MaiLoverPlugin(MaiBotPlugin):
 
     @HookHandler("maisaka.planner.before_request")
     async def on_planner_before_request(self, **kwargs: Any) -> dict[str, Any]:
-        """注入麦麦当前活动状态到 planner 的 extra_prompt。
+        """把麦麦当前状态（日期 / 活动 / 好感度）注入 planner 请求上下文。
 
-        每次 planner 请求时触发（含用户正常回复和 proactive trigger），
-        让麦麦在任何时候都知道自己在做什么。
+        每次 planner 请求时触发（含用户正常回复与 proactive trigger），
+        让麦麦在任何时刻都知道自己"现在在做什么"。
 
-        追加方式（非覆盖）：在已有 extra_prompt 后拼接状态后缀。
+        契约随主程序版本变化，需双兼容：
+        - MaiBot 1.2.5+ / SDK 2.8.x：planner hook 载荷为 Context Items
+          （``items`` + ``item_schema_version``），旧字段 ``extra_prompt`` 已移除；
+          注入方式为向 items 追加 System 消息项。
+        - 旧版：``extra_prompt`` 为字符串，追加（非覆盖）。
+
+        按 kwargs 中**实际存在的键**判断走哪条路；两者都缺失时跳过注入，
+        不消费任何状态，等待下次请求。
         """
         if not self._schedule_gen or not self._holiday_svc:
             return {"action": "continue", "modified_kwargs": kwargs}
@@ -252,7 +292,7 @@ class MaiLoverPlugin(MaiBotPlugin):
         try:
             import json as _json
             kwargs_size = len(_json.dumps(kwargs, default=str, ensure_ascii=False))
-            if kwargs_size > 500_000:  # 500KB 硬阈值：超过才放弃
+            if kwargs_size > 500_000:  # 500KB 硬阈值：超过才尝试截断
                 # 尝试截断大字段后再注入
                 truncated = self._truncate_kwargs_for_injection(kwargs)
                 truncated_size = len(_json.dumps(truncated, default=str, ensure_ascii=False))
@@ -261,11 +301,16 @@ class MaiLoverPlugin(MaiBotPlugin):
                         f"planner kwargs 过大 ({kwargs_size}→{truncated_size} bytes)，已截断大字段后注入"
                     )
                     kwargs = truncated
-                else:
-                    self.ctx.logger.debug(
-                        f"planner kwargs 过大 ({kwargs_size} bytes)，无可截断字段，跳过注入"
+                elif kwargs_size > 1_000_000:
+                    # 超过 1MB 且无可截断字段，此时才降级为放弃注入
+                    self.ctx.logger.warning(
+                        f"planner kwargs 过大 ({kwargs_size} bytes) 且无可截断字段，跳过活动注入"
                     )
                     return {"action": "continue", "modified_kwargs": kwargs}
+                else:
+                    self.ctx.logger.debug(
+                        f"planner kwargs 较大 ({kwargs_size} bytes) 但无可截断字段，继续注入"
+                    )
         except Exception as exc:
             self.ctx.logger.debug("planner kwargs size check 异常: %s", type(exc).__name__)
 
@@ -284,10 +329,56 @@ class MaiLoverPlugin(MaiBotPlugin):
             f"\n【{name}对用户的好感度】档位 {affection_level}（{affection_desc}）"
         )
 
-        # 追加非覆盖
-        kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
+        # 新版（MaiBot 1.2.5+ / SDK 2.8.x）：注入 Context Items
+        items = kwargs.get("items")
+        if isinstance(items, list):
+            self._inject_state_item(items, suffix)
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        # 旧版：extra_prompt 字符串追加（非覆盖）
+        if "extra_prompt" in kwargs:
+            kwargs["extra_prompt"] = (kwargs.get("extra_prompt") or "") + suffix
+            return {"action": "continue", "modified_kwargs": kwargs}
+
+        # 契约不匹配（既无 items 也无 extra_prompt）：不注入、不消费状态
+        self.ctx.logger.warning(
+            "planner hook kwargs 既无 items 也无 extra_prompt，跳过状态注入"
+        )
         return {"action": "continue", "modified_kwargs": kwargs}
 
+    @staticmethod
+    def _inject_state_item(items: list[Any], text: str) -> None:
+        """把状态文本注入 planner 的 Context Items（原地修改）。
+
+        优先追加到最后一条 SystemMessageItem 的 ``parts``；若载荷中没有
+        System 消息项，则新建一个 SystemMessageItem 追加到列表末尾。
+
+        Item 结构须满足主程序 ``deserialize_context_item_snapshot`` 的校验：
+        ``item_type`` 为非空字符串、``meta`` 必含 ``item_id`` / ``logical_turn_id`` /
+        ``timestamp``（合法 ISO 时间）、``parts`` 每项为 ``{"type": "text", "text": ...}``。
+
+        Args:
+            items: planner hook 载荷中的 Context Item 字典列表。
+            text: 待注入的状态文本。
+        """
+        for item in reversed(items):
+            if isinstance(item, dict) and item.get("item_type") == "SystemMessageItem":
+                parts = item.get("parts")
+                if isinstance(parts, list):
+                    parts.append({"type": "text", "text": text})
+                    return
+
+        items.append(
+            {
+                "item_type": "SystemMessageItem",
+                "meta": {
+                    "item_id": uuid.uuid4().hex,
+                    "logical_turn_id": None,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                "parts": [{"type": "text", "text": text}],
+            }
+        )
     @HookHandler("maisaka.replyer.after_response", mode=HookMode.OBSERVE)
     async def on_replyer_after_response(self, **kwargs: Any) -> None:
         """planner 实际生成回复时，补计 0.5 触发数。
@@ -720,8 +811,8 @@ class MaiLoverPlugin(MaiBotPlugin):
             configured = self.config.plugin.lover_name
             if configured and configured.strip():
                 return configured.strip()
-        except Exception as exc:
-            self.ctx.logger.debug("MaiLover: 读取 lover_name 配置失败（属性不存在或值非法）: %s", exc)
+        except Exception:
+            pass
         if self._cached_nickname:
             return self._cached_nickname
         return "麦麦"
@@ -742,13 +833,49 @@ class MaiLoverPlugin(MaiBotPlugin):
     def _get_data_dir(self) -> str:
         """获取插件数据目录路径。
 
-        数据写入插件目录下的 data/ 子目录，避免插件更新（git pull）时
-        覆盖用户运行时数据（affection_memory.json、schedule_cache.json）。
+        SDK 2.6.0+ 使用框架标准持久化目录 ctx.paths.data_dir，
+        自动回退旧式自建 data 目录以兼容 SDK 2.5.x。
 
         Returns:
             数据目录绝对路径。
         """
+        paths = getattr(self.ctx, "paths", None)
+        if paths is not None:
+            return str(paths.data_dir)
+        # SDK 2.5.x 降级：在插件源码目录下自建 data/
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+    def _migrate_old_data_dir(self, new_data_dir: str) -> None:
+        """将旧式自建 data 目录的数据迁移到框架标准持久化目录。
+
+        SDK 2.6.0+ 推荐使用 ctx.paths.data_dir，旧版本插件在源码目录下
+        自建 data/。首次迁移时自动复制旧数据文件（不覆盖已有文件）。
+
+        Args:
+            new_data_dir: 新数据目录路径（ctx.paths.data_dir 或降级路径）。
+        """
+        old_data_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data"
+        )
+        if not os.path.isdir(old_data_dir):
+            return
+        if os.path.abspath(old_data_dir) == os.path.abspath(new_data_dir):
+            return  # 同一目录（SDK 2.5.x 降级场景），无需迁移
+
+        import shutil
+        migrated = []
+        for fname in os.listdir(old_data_dir):
+            src = os.path.join(old_data_dir, fname)
+            dst = os.path.join(new_data_dir, fname)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+                migrated.append(fname)
+
+        if migrated:
+            self.ctx.logger.info(
+                f"已从旧目录迁移 {len(migrated)} 个文件: "
+                f"{old_data_dir} -> {new_data_dir} ({', '.join(migrated)})"
+            )
 
     async def _resolve_stream_id(self, target_qq: str) -> str:
         """获取目标 QQ 的私聊 stream_id（纯 SDK 路径）。

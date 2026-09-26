@@ -16,6 +16,7 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+<<<<<<< HEAD
 
 # ===== 主人本地副本规则（2026-08-19 重写：从豁免改为严格忽略）=====
 # 主人哲学变更：以前豁免 config.toml / cookies / data 入库方便回溯；现在改为默认忽略。
@@ -37,3 +38,5 @@ data/
 #!data/.gitkeep
 # OMC CLI 状态文件（不纳入仓库）
 .omc/
+=======
+>>>>>>> origin/main
