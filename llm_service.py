@@ -35,12 +35,21 @@ class LLMService:
 
     @property
     def _model(self) -> str:
-        """获取配置的 LLM 模型名称。
+        """获取配置的 LLM 任务名。
+
+        MaiBot 1.2.5 的插件 LLM 能力统一以任务名（``task_name``）路由，
+        主程序合法任务名白名单为：embedding、emoji、expression_use、learner、
+        memory、mid_memory、planner、replyer、utils、vlm、voice。
+        配置里的 ``reply`` 属于历史遗留写法，主程序并无该任务，此处统一
+        归一化为 ``replyer``；空字符串表示使用主程序默认任务。
 
         Returns:
-            模型名称字符串（如 'planner'），空字符串表示使用全局默认。
+            任务名字符串（如 'planner' / 'replyer'），空字符串表示使用全局默认。
         """
-        return self._config.plugin.llm_model
+        task_name = str(self._config.plugin.llm_model or "").strip()
+        if task_name == "reply":
+            return "replyer"
+        return task_name
 
     async def generate(
         self,
@@ -73,7 +82,7 @@ class LLMService:
                 prompt_arg = prompt
             result: dict[str, Any] = await self._ctx.llm.generate(
                 prompt=prompt_arg,
-                model=self._model,
+                task_name=self._model,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
