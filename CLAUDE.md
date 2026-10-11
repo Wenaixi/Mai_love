@@ -1,5 +1,13 @@
 # maibot-community mai-love
 
+## 官方上游与版本溯源
+- 官方仓库（Upstream Repository）：https://github.com/octmicy/Mai_love
+- 官方作者（Author / Maintainer）：octmicy
+- 功能定位：麦麦好感度与互动情感系统
+- 本地演进定位：基于官方上游最新版本，融入本地生产环境兼容性定制与稳定性加固。
+- 本地专属定制：本地合并上游 v2.2.1 补丁并保留本地 task_name 与非法任务名枚举归一化修复。
+
+
 ## 插件基本信息
 
 - 插件 ID：`maibot-community.mai-love`
